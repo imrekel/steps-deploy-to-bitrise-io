@@ -5,19 +5,17 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"github.com/bitrise-io/go-utils/pathutil"
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/bitrise-io/bitrise/models"
-	"github.com/bitrise-io/go-utils/colorstring"
 	"github.com/bitrise-io/go-utils/fileutil"
 	"github.com/bitrise-io/go-utils/log"
+	"github.com/bitrise-io/go-utils/pathutil"
 	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/test/converters"
 )
 
@@ -68,26 +66,14 @@ func httpCall(apiToken, method, url string, input io.Reader, output interface{})
 		return err
 	}
 
-	b, err := httputil.DumpRequest(req, true)
-	if err != nil {
-		return err
-	}
-	log.Debugf(string(b))
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 
-	b, err = httputil.DumpResponse(resp, true)
-	if err != nil {
-		return err
-	}
-	log.Debugf(string(b))
-
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			fmt.Printf("Failed to close body, error: %s\n", err)
+			log.Warnf("Failed to close body: %s", err)
 		}
 	}()
 
@@ -133,7 +119,7 @@ func ParseTestResults(testsRootDir string) (results Results, err error) {
 		testDirPath := filepath.Join(testsRootDir, testDir.Name())
 
 		if !testDir.IsDir() {
-			log.Debugf(colorstring.Yellowf("%s is not a directory", testDirPath))
+			log.Debugf("%s is not a directory", testDirPath)
 			continue
 		}
 
@@ -145,14 +131,24 @@ func ParseTestResults(testsRootDir string) (results Results, err error) {
 
 		// find step-info in dir, continue if no step-info.json as this file is only required if step has exported artifacts also
 		// <root_tests_dir>/<test_dir>/step-info.json
+
+		stepInfoPth := filepath.Join(testDirPath, "step-info.json")
+		if isExists, err := pathutil.IsPathExists(stepInfoPth); err != nil {
+			log.Warnf("Failed to check if step-info.json file exists in dir: %s: %s", testDirPath, err)
+			continue
+		} else if !isExists {
+			continue
+		}
+
 		var stepInfo *models.TestResultStepInfo
-		stepInfoFileContent, err := fileutil.ReadBytesFromFile(filepath.Join(testDirPath, "step-info.json"))
+		stepInfoFileContent, err := fileutil.ReadBytesFromFile(stepInfoPth)
 		if err != nil {
-			log.Debugf(colorstring.Yellowf("Failed to read step-info.json file in dir: %s, error: %s", testDirPath, err))
+			log.Warnf("Failed to read step-info.json file in dir: %s, error: %s", testDirPath, err)
 			continue
 		}
 
 		if err := json.Unmarshal(stepInfoFileContent, &stepInfo); err != nil {
+			log.Warnf("Failed to parse step-info.json file in dir: %s, error: %s", testDirPath, err)
 			continue
 		}
 
@@ -223,6 +219,16 @@ func ParseTestResults(testsRootDir string) (results Results, err error) {
 // Upload ...
 func (results Results) Upload(apiToken, endpointBaseURL, appSlug, buildSlug string) error {
 	for _, result := range results {
+		if len(result.ImagePaths) > 0 {
+			log.Printf("Uploading: %s with attachments:", result.Name)
+			for _, pth := range result.ImagePaths {
+				log.Printf("- %s", pth)
+			}
+			log.Printf("")
+		} else {
+			log.Printf("Uploading: %s", result.Name)
+		}
+
 		uploadReq := UploadRequest{
 			FileInfo: FileInfo{
 				FileName: "test_result.xml",

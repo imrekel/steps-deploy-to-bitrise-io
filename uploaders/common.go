@@ -3,6 +3,7 @@ package uploaders
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -10,12 +11,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/bitrise-io/go-utils/log"
 	"github.com/bitrise-io/go-utils/retry"
 	"github.com/bitrise-io/go-utils/urlutil"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/deployment"
 )
 
 // ArtifactURLs ...
@@ -24,9 +27,15 @@ type ArtifactURLs struct {
 	PermanentDownloadURL string
 }
 
-func createArtifact(buildURL, token, artifactPth, artifactType string) (string, string, error) {
-	log.Printf("creating artifact")
+// AppDeploymentMetaData ...
+type AppDeploymentMetaData struct {
+	ArtifactInfo       map[string]interface{}
+	NotifyUserGroups   string
+	NotifyEmails       string
+	IsEnablePublicPage bool
+}
 
+func createArtifact(buildURL, token, artifactPth, artifactType, contentType string) (string, string, error) {
 	// create form data
 	artifactName := filepath.Base(artifactPth)
 	fileSize, err := fileSizeInBytes(artifactPth)
@@ -38,9 +47,13 @@ func createArtifact(buildURL, token, artifactPth, artifactType string) (string, 
 	roundedMegaBytes := int(roundPlus(megaBytes, 2))
 
 	if roundedMegaBytes < 1 {
-		log.Printf("  file size: %dB", int(fileSize))
+		log.Printf("file size: %dB", int(fileSize))
 	} else {
-		log.Printf("  file size: %dMB", roundedMegaBytes)
+		log.Printf("file size: %dMB", roundedMegaBytes)
+	}
+
+	if strings.TrimSpace(token) == "" {
+		return "", "", fmt.Errorf("provided API token is empty")
 	}
 
 	data := url.Values{
@@ -49,6 +62,7 @@ func createArtifact(buildURL, token, artifactPth, artifactType string) (string, 
 		"filename":        {artifactName},
 		"artifact_type":   {artifactType},
 		"file_size_bytes": {fmt.Sprintf("%d", int(fileSize))},
+		"content_type":    {contentType},
 	}
 	// ---
 
@@ -89,7 +103,15 @@ func createArtifact(buildURL, token, artifactPth, artifactType string) (string, 
 			return fmt.Errorf("failed to read create artifact response, error: %s", err)
 		}
 		if response.StatusCode != http.StatusOK {
-			return fmt.Errorf("failed to create artifact on bitrise, status code: %d, response: %s", response.StatusCode, string(body))
+			type errorResponse struct {
+				ErrorMessage string `json:"error_msg"`
+			}
+			var createResponse errorResponse
+			if unmarshalErr := json.Unmarshal(body, &createResponse); unmarshalErr != nil {
+				return errors.New(string(body))
+			}
+
+			return errors.New(createResponse.ErrorMessage)
 		}
 
 		if err := json.Unmarshal(body, &artifactResponse); err != nil {
@@ -115,8 +137,6 @@ func createArtifact(buildURL, token, artifactPth, artifactType string) (string, 
 }
 
 func uploadArtifact(uploadURL, artifactPth, contentType string) error {
-	log.Printf("uploading artifact")
-
 	netClient := &http.Client{
 		Timeout: 10 * time.Minute,
 	}
@@ -132,7 +152,6 @@ func uploadArtifact(uploadURL, artifactPth, contentType string) error {
 			}
 		}()
 
-		// Set Content Length manually (https://stackoverflow.com/a/39764726), as it is part of signature in signed URL
 		fileInfo, err := file.Stat()
 		if err != nil {
 			return fmt.Errorf("failed to get file info for %s, error: %s", artifactPth, err)
@@ -155,6 +174,7 @@ func uploadArtifact(uploadURL, artifactPth, contentType string) error {
 			request.Header.Add("Content-Type", contentType)
 		}
 
+		request.Header.Add("X-Upload-Content-Length", strconv.FormatInt(fileInfo.Size(), 10)) // header used by Google Cloud Storage signed URLs
 		request.ContentLength = fileInfo.Size()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -185,23 +205,41 @@ func uploadArtifact(uploadURL, artifactPth, contentType string) error {
 	})
 }
 
-func finishArtifact(buildURL, token, artifactID, artifactInfo, notifyUserGroups, notifyEmails, isEnablePublicPage string) (ArtifactURLs, error) {
-	log.Printf("finishing artifact")
-
+func finishArtifact(buildURL, token, artifactID string, appDeploymentMeta *AppDeploymentMetaData, pipelineMeta *deployment.IntermediateFileMetaData) (ArtifactURLs, error) {
 	// create form data
 	data := url.Values{"api_token": {token}}
-	if artifactInfo != "" {
-		data["artifact_info"] = []string{artifactInfo}
+	isEnablePublicPage := false
+	if appDeploymentMeta != nil {
+		artifactInfoBytes, err := json.Marshal(appDeploymentMeta.ArtifactInfo)
+		if err != nil {
+			return ArtifactURLs{}, fmt.Errorf("failed to marshal app deployment meta: %s", err)
+		}
+		artifactInfo := string(artifactInfoBytes)
+
+		if artifactInfo != "" {
+			data["artifact_info"] = []string{artifactInfo}
+		}
+		if appDeploymentMeta.NotifyUserGroups != "" {
+			data["notify_user_groups"] = []string{appDeploymentMeta.NotifyUserGroups}
+		}
+		if appDeploymentMeta.NotifyEmails != "" {
+			data["notify_emails"] = []string{appDeploymentMeta.NotifyEmails}
+		}
+		if appDeploymentMeta.IsEnablePublicPage {
+			data["is_enable_public_page"] = []string{"yes"}
+			isEnablePublicPage = true
+		}
 	}
-	if notifyUserGroups != "" {
-		data["notify_user_groups"] = []string{notifyUserGroups}
+
+	if pipelineMeta != nil {
+		pipelineInfoBytes, err := json.Marshal(pipelineMeta)
+		if err != nil {
+			return ArtifactURLs{}, fmt.Errorf("failed to marshal deployment meta: %s", err)
+		}
+
+		data["intermediate_file_info"] = []string{string(pipelineInfoBytes)}
 	}
-	if notifyEmails != "" {
-		data["notify_emails"] = []string{notifyEmails}
-	}
-	if isEnablePublicPage == "true" {
-		data["is_enable_public_page"] = []string{"yes"}
-	}
+
 	// ---
 
 	// perform request
@@ -255,7 +293,7 @@ func finishArtifact(buildURL, token, artifactID, artifactInfo, notifyUserGroups,
 		log.Warnf("Invalid e-mail addresses: %s", strings.Join(artifactResponse.InvalidEmails, ", "))
 	}
 
-	if isEnablePublicPage == "true" {
+	if isEnablePublicPage {
 		if artifactResponse.PublicInstallPageURL == "" {
 			return ArtifactURLs{}, fmt.Errorf("public install page was enabled, but no public install page generated")
 		}

@@ -1,17 +1,16 @@
 package uploaders
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/bitrise-io/go-utils/log"
 	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/androidartifact"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/deployment"
 )
 
 // DeployAPK ...
-func DeployAPK(pth string, artifacts []string, buildURL, token, notifyUserGroups, notifyEmails, isEnablePublicPage string) (ArtifactURLs, error) {
-	log.Printf("analyzing apk")
-
+func DeployAPK(item deployment.DeployableItem, artifacts []string, buildURL, token, notifyUserGroups, notifyEmails string, isEnablePublicPage bool) (ArtifactURLs, error) {
+	pth := item.Path
 	apkInfo, err := androidartifact.GetAPKInfo(pth)
 	if err != nil {
 		return ArtifactURLs{}, err
@@ -25,7 +24,7 @@ func DeployAPK(pth string, artifacts []string, buildURL, token, notifyUserGroups
 		"min_sdk_version": apkInfo.MinSDKVersion,
 	}
 
-	log.Printf("  apk infos: %v", appInfo)
+	log.Printf("apk infos: %v", appInfo)
 
 	if apkInfo.PackageName == "" {
 		log.Warnf("Package name is undefined, AndroidManifest.xml package content:\n%s", apkInfo.RawPackageContent)
@@ -65,23 +64,26 @@ func DeployAPK(pth string, artifacts []string, buildURL, token, notifyUserGroups
 		apkInfoMap["universal"] = splitMeta.UniversalApk
 	}
 
-	artifactInfoBytes, err := json.Marshal(apkInfoMap)
-	if err != nil {
-		return ArtifactURLs{}, fmt.Errorf("failed to marshal apk infos, error: %s", err)
-	}
-
 	// ---
 
-	uploadURL, artifactID, err := createArtifact(buildURL, token, pth, "android-apk")
+	const APKContentType = "application/vnd.android.package-archive"
+	uploadURL, artifactID, err := createArtifact(buildURL, token, pth, "android-apk", APKContentType)
 	if err != nil {
-		return ArtifactURLs{}, fmt.Errorf("failed to create apk artifact, error: %s", err)
+		return ArtifactURLs{}, fmt.Errorf("failed to create apk artifact: %s %w", pth, err)
 	}
 
-	if err := uploadArtifact(uploadURL, pth, "application/vnd.android.package-archive"); err != nil {
+	if err := uploadArtifact(uploadURL, pth, APKContentType); err != nil {
 		return ArtifactURLs{}, fmt.Errorf("failed to upload apk artifact, error: %s", err)
 	}
 
-	artifactURLs, err := finishArtifact(buildURL, token, artifactID, string(artifactInfoBytes), notifyUserGroups, notifyEmails, isEnablePublicPage)
+	buildArtifactMeta := AppDeploymentMetaData{
+		ArtifactInfo:       apkInfoMap,
+		NotifyUserGroups:   notifyUserGroups,
+		NotifyEmails:       notifyEmails,
+		IsEnablePublicPage: isEnablePublicPage,
+	}
+
+	artifactURLs, err := finishArtifact(buildURL, token, artifactID, &buildArtifactMeta, item.IntermediateFileMeta)
 	if err != nil {
 		return ArtifactURLs{}, fmt.Errorf("failed to finish apk artifact, error: %s", err)
 	}

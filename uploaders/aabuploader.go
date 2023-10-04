@@ -1,35 +1,36 @@
 package uploaders
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 
 	"github.com/bitrise-io/go-utils/log"
 	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/androidartifact"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/androidsignature"
 	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/bundletool"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/deployment"
 )
 
 // DeployAAB ...
-func DeployAAB(pth string, artifacts []string, buildURL, token, bundletoolVersion string) (ArtifactURLs, error) {
-	log.Printf("- analyzing aab")
-
-	// get aab manifest dump
-	log.Printf("- fetching info")
-
+func DeployAAB(item deployment.DeployableItem, artifacts []string, buildURL, token, bundletoolVersion string) (ArtifactURLs, error) {
+	pth := item.Path
 	r, err := bundletool.New(bundletoolVersion)
 	if err != nil {
 		return ArtifactURLs{}, err
 	}
 	cmd := r.Command("dump", "manifest", "--bundle", pth)
 
-	log.Donef("$ %s", cmd.PrintableCommandArgs())
-
 	out, err := cmd.RunAndReturnTrimmedCombinedOutput()
 	if err != nil {
-		return ArtifactURLs{}, err
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return ArtifactURLs{}, fmt.Errorf("command failed with exit status %d (%s): %s", exitErr.ExitCode(), cmd.PrintableCommandArgs(), out)
+		}
+		return ArtifactURLs{}, fmt.Errorf("executing command failed (%s): %w", cmd.PrintableCommandArgs(), err)
 	}
 
-	packageName, versionCode, versionName := androidartifact.ParsePackageInfos(out)
+	packageName, versionCode, versionName := androidartifact.ParsePackageInfos(out, true)
 
 	appInfo := map[string]interface{}{
 		"package_name": packageName,
@@ -37,7 +38,7 @@ func DeployAAB(pth string, artifacts []string, buildURL, token, bundletoolVersio
 		"version_name": versionName,
 	}
 
-	log.Printf("  aab infos: %v", appInfo)
+	log.Printf("aab infos: %v", appInfo)
 
 	if packageName == "" {
 		log.Warnf("Package name is undefined, AndroidManifest.xml package content:\n%s", out)
@@ -68,9 +69,15 @@ func DeployAAB(pth string, artifacts []string, buildURL, token, bundletoolVersio
 		"build_type":      info.BuildType,
 	}
 
+	signature, err := androidsignature.Read(pth)
+	if err != nil {
+		log.Warnf("Failed to read signature: %s", err)
+	}
+	aabInfoMap["signed_by"] = signature
+
 	splitMeta, err := androidartifact.CreateSplitArtifactMeta(pth, artifacts)
 	if err != nil {
-		log.Errorf("Failed to create split meta, error: %s", err)
+		log.Warnf("Failed to create split meta, error: %s", err)
 	} else {
 		aabInfoMap["apk"] = splitMeta.APK
 		aabInfoMap["aab"] = splitMeta.AAB
@@ -78,22 +85,26 @@ func DeployAAB(pth string, artifacts []string, buildURL, token, bundletoolVersio
 		aabInfoMap["universal"] = splitMeta.UniversalApk
 	}
 
-	artifactInfoBytes, err := json.Marshal(aabInfoMap)
-	if err != nil {
-		return ArtifactURLs{}, fmt.Errorf("failed to marshal apk infos, error: %s", err)
-	}
-
 	// ---
 
-	uploadURL, artifactID, err := createArtifact(buildURL, token, pth, "android-apk")
+	const AABContentType = "application/octet-stream aab"
+	uploadURL, artifactID, err := createArtifact(buildURL, token, pth, "android-apk", AABContentType)
 	if err != nil {
-		return ArtifactURLs{}, fmt.Errorf("failed to create apk artifact, error: %s", err)
+		return ArtifactURLs{}, fmt.Errorf("failed to create apk artifact: %s %w", pth, err)
 	}
 
-	if err := uploadArtifact(uploadURL, pth, "application/octet-stream aab"); err != nil {
+	if err := uploadArtifact(uploadURL, pth, AABContentType); err != nil {
 		return ArtifactURLs{}, fmt.Errorf("failed to upload apk artifact, error: %s", err)
 	}
-	artifactURLs, err := finishArtifact(buildURL, token, artifactID, string(artifactInfoBytes), "", "", "false")
+
+	buildArtifactMeta := AppDeploymentMetaData{
+		ArtifactInfo:       aabInfoMap,
+		NotifyUserGroups:   "",
+		NotifyEmails:       "",
+		IsEnablePublicPage: false,
+	}
+
+	artifactURLs, err := finishArtifact(buildURL, token, artifactID, &buildArtifactMeta, item.IntermediateFileMeta)
 	if err != nil {
 		return ArtifactURLs{}, fmt.Errorf("failed to finish apk artifact, error: %s", err)
 	}

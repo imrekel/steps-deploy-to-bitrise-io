@@ -1,19 +1,18 @@
 package uploaders
 
 import (
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 
-	"github.com/bitrise-io/go-utils/pathutil"
-
 	"github.com/bitrise-io/go-utils/log"
+	"github.com/bitrise-io/go-utils/pathutil"
 	"github.com/bitrise-io/go-xcode/xcarchive"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/deployment"
 )
 
 // DeployXcarchive ...
-func DeployXcarchive(pth, buildURL, token string) (ArtifactURLs, error) {
-	log.Printf("analyzing xcarchive")
+func DeployXcarchive(item deployment.DeployableItem, buildURL, token string) (ArtifactURLs, error) {
+	pth := item.Path
 	unzippedPth, err := xcarchive.UnzipXcarchive(pth)
 	if err != nil {
 		return ArtifactURLs{}, err
@@ -24,6 +23,7 @@ func DeployXcarchive(pth, buildURL, token string) (ArtifactURLs, error) {
 	if err != nil {
 		return ArtifactURLs{}, fmt.Errorf("could not check if given project is macOS or not, error: %s", err)
 	} else if isMacos {
+		log.Warnf("macOS archive deployment is not supported, skipping file: %s", archivePth)
 		return ArtifactURLs{}, nil // MacOS project is not supported, so won't be deployed.
 	}
 
@@ -62,23 +62,25 @@ func DeployXcarchive(pth, buildURL, token string) (ArtifactURLs, error) {
 		"scheme":          scheme,
 	}
 
-	artifactInfoBytes, err := json.Marshal(xcarchiveInfoMap)
-	if err != nil {
-		return ArtifactURLs{}, fmt.Errorf("failed to marshal xcarchive infos, error: %s", err)
-	}
+	log.Printf("xcarchive infos: %v", appInfo)
 
-	log.Printf("  xcarchive infos: %v", appInfo)
-
-	uploadURL, artifactID, err := createArtifact(buildURL, token, pth, "ios-xcarchive")
+	uploadURL, artifactID, err := createArtifact(buildURL, token, pth, "ios-xcarchive", "")
 	if err != nil {
-		return ArtifactURLs{}, fmt.Errorf("failed to create xcarchive artifact, error: %s", err)
+		return ArtifactURLs{}, fmt.Errorf("failed to create xcarchive artifact: %s %w", pth, err)
 	}
 
 	if err := uploadArtifact(uploadURL, pth, ""); err != nil {
 		return ArtifactURLs{}, fmt.Errorf("failed to upload xcarchive artifact, error: %s", err)
 	}
 
-	artifactURLs, err := finishArtifact(buildURL, token, artifactID, string(artifactInfoBytes), "", "", "false")
+	buildArtifactMeta := AppDeploymentMetaData{
+		ArtifactInfo:       xcarchiveInfoMap,
+		NotifyUserGroups:   "",
+		NotifyEmails:       "",
+		IsEnablePublicPage: false,
+	}
+
+	artifactURLs, err := finishArtifact(buildURL, token, artifactID, &buildArtifactMeta, item.IntermediateFileMeta)
 	if err != nil {
 		return ArtifactURLs{}, fmt.Errorf("failed to finish xcarchive artifact, error: %s", err)
 	}

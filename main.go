@@ -8,14 +8,22 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/test"
-
+	"github.com/bitrise-io/bitrise/models"
 	"github.com/bitrise-io/envman/envman"
 	"github.com/bitrise-io/go-steputils/stepconf"
 	"github.com/bitrise-io/go-steputils/tools"
+	"github.com/bitrise-io/go-steputils/v2/secretkeys"
 	"github.com/bitrise-io/go-utils/log"
 	"github.com/bitrise-io/go-utils/pathutil"
+	"github.com/bitrise-io/go-utils/v2/env"
+	"github.com/bitrise-io/go-utils/v2/errorutil"
+	"github.com/bitrise-io/go-utils/v2/exitcode"
+	"github.com/bitrise-io/go-utils/v2/fileutil"
+	pathutil2 "github.com/bitrise-io/go-utils/v2/pathutil"
 	"github.com/bitrise-io/go-utils/ziputil"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/deployment"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/fileredactor"
+	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/test"
 	"github.com/bitrise-steplib/steps-deploy-to-bitrise-io/uploaders"
 )
 
@@ -23,14 +31,15 @@ var fileBaseNamesToSkip = []string{".DS_Store"}
 
 // Config ...
 type Config struct {
+	PipelineIntermediateFiles     string `env:"pipeline_intermediate_files"`
 	BuildURL                      string `env:"build_url,required"`
 	APIToken                      string `env:"build_api_token,required"`
-	IsCompress                    string `env:"is_compress,opt[true,false]"`
+	IsCompress                    bool   `env:"is_compress,opt[true,false]"`
 	ZipName                       string `env:"zip_name"`
-	DeployPath                    string `env:"deploy_path,required"`
+	DeployPath                    string `env:"deploy_path"`
 	NotifyUserGroups              string `env:"notify_user_groups"`
 	NotifyEmailList               string `env:"notify_email_list"`
-	IsPublicPageEnabled           string `env:"is_enable_public_page,opt[true,false]"`
+	IsPublicPageEnabled           bool   `env:"is_enable_public_page,opt[true,false]"`
 	PublicInstallPageMapFormat    string `env:"public_install_page_url_map_format,required"`
 	PermanentDownloadURLMapFormat string `env:"permanent_download_url_map_format,required"`
 	BuildSlug                     string `env:"BITRISE_BUILD_SLUG,required"`
@@ -38,6 +47,7 @@ type Config struct {
 	AppSlug                       string `env:"BITRISE_APP_SLUG,required"`
 	AddonAPIBaseURL               string `env:"addon_api_base_url,required"`
 	AddonAPIToken                 string `env:"addon_api_token"`
+	FilesToRedact                 string `env:"files_to_redact"`
 	DebugMode                     bool   `env:"debug_mode,opt[true,false]"`
 	BundletoolVersion             string `env:"bundletool_version,required"`
 }
@@ -72,43 +82,110 @@ func main() {
 	}
 
 	stepconf.Print(config)
-	fmt.Println()
 	log.SetEnableDebugLog(config.DebugMode)
-
-	absDeployPth, err := pathutil.AbsPath(config.DeployPath)
-	if err != nil {
-		fail("Failed to expand path: %s, error: %s", config.DeployPath, err)
-	}
 
 	tmpDir, err := pathutil.NormalizedOSTempDirPath("__deploy-to-bitrise-io__")
 	if err != nil {
 		fail("Failed to create tmp dir, error: %s", err)
 	}
 
-	filesToDeploy, err := collectFilesToDeploy(absDeployPth, config, tmpDir)
+	fmt.Println()
+	log.Infof("Collecting files to redact...")
+
+	pathModifier := pathutil2.NewPathModifier()
+	pathChecker := pathutil2.NewPathChecker()
+	pathProcessor := fileredactor.NewFilePathProcessor(pathModifier, pathChecker)
+	filePaths, err := pathProcessor.ProcessFilePaths(config.FilesToRedact)
 	if err != nil {
-		fail("%s", err)
+		log.Errorf(errorutil.FormattedError(fmt.Errorf("failed to collect file paths to redact: %w", err)))
+		os.Exit(int(exitcode.Failure))
 	}
-	clearedFilesToDeploy := clearDeployFiles(filesToDeploy)
-	fmt.Println()
-	log.Infof("List of files to deploy")
-	logDeployFiles(clearedFilesToDeploy)
+
+	if len(filePaths) > 0 {
+		log.Printf("List of files to redact:")
+		for _, path := range filePaths {
+			log.Printf("- %s", path)
+		}
+
+		fileManager := fileutil.NewFileManager()
+		redactor := fileredactor.NewFileRedactor(fileManager)
+		secrets := loadSecrets()
+		err = redactor.RedactFiles(filePaths, secrets)
+		if err != nil {
+			log.Errorf(errorutil.FormattedError(fmt.Errorf("failed to redact files: %w", err)))
+			os.Exit(int(exitcode.Failure))
+		}
+	} else {
+		log.Printf("No files to redact...")
+	}
 
 	fmt.Println()
-	log.Infof("Deploying files")
+	log.Infof("Collecting files to deploy...")
 
-	artifactURLCollection, err := deploy(clearedFilesToDeploy, config)
-	if err != nil {
-		fail("%s", err)
-	}
-	fmt.Println()
-	log.Donef("Success")
-	log.Printf("You can find the Artifact on Bitrise, on the Build's page: %s", config.BuildURL)
+	var deployableItems []deployment.DeployableItem
+	if strings.TrimSpace(config.DeployPath) != "" {
+		absDeployPth, err := pathutil.AbsPath(config.DeployPath)
+		if err != nil {
+			fail("Failed to expand path: %s, error: %s", config.DeployPath, err)
+		}
 
-	if err := exportInstallPages(artifactURLCollection, config); err != nil {
-		fail("%s", err)
+		filesToDeploy, err := collectFilesToDeploy(absDeployPth, config, tmpDir)
+		if err != nil {
+			fail("%s", err)
+		}
+		clearedFilesToDeploy := clearDeployFiles(filesToDeploy)
+		deployableItems = deployment.ConvertPaths(clearedFilesToDeploy)
 	}
-	deployTestResults(config)
+
+	if strings.TrimSpace(config.PipelineIntermediateFiles) != "" {
+		zipComparator := deployment.NewZipComparator(deployment.DefaultReadZipFunction)
+		repository := env.NewRepository()
+		collector := deployment.NewCollector(zipComparator, deployment.DefaultIsDirFunction, ziputil.ZipDir, repository, tmpDir)
+		deployableItems, err = collector.AddIntermediateFiles(deployableItems, config.PipelineIntermediateFiles)
+		if err != nil {
+			fail("%s", err)
+		}
+	}
+
+	if len(deployableItems) == 0 {
+		log.Printf("No deployment files were defined. Please check the deploy_path and pipeline_intermediate_files inputs.")
+	} else {
+		log.Printf("List of files to deploy:")
+		logDeployFiles(deployableItems)
+
+		fmt.Println()
+		log.Infof("Deploying files...")
+		artifactURLCollection, err := deploy(deployableItems, config)
+		if err != nil {
+			fmt.Println()
+			fail(errorutil.FormattedError(err))
+		}
+
+		log.Donef("Success")
+		log.Printf("You can find the Build Artifact on the Build's page: %s", config.BuildURL)
+
+		if err := exportInstallPages(artifactURLCollection, config); err != nil {
+			fail("%s", err)
+		}
+	}
+
+	if config.AddonAPIToken != "" {
+		deployTestResults(config)
+	}
+}
+
+func loadSecrets() []string {
+	envRepository := env.NewRepository()
+	keys := secretkeys.NewManager().Load(envRepository)
+
+	var values []string
+	for _, key := range keys {
+		value := envRepository.Get(key)
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
 }
 
 func exportInstallPages(artifactURLCollection ArtifactURLCollection, config Config) error {
@@ -125,7 +202,6 @@ func exportInstallPages(artifactURLCollection ArtifactURLCollection, config Conf
 			return fmt.Errorf("failed to export BITRISE_PUBLIC_INSTALL_PAGE_URL_MAP, error: %s", err)
 		}
 		log.Printf("A map of deployed files and their public install page urls is now available in the Environment Variable: BITRISE_PUBLIC_INSTALL_PAGE_URL_MAP (value: %s)", value)
-		log.Printf("")
 	}
 	if len(artifactURLCollection.PermanentDownloadURLs) > 0 {
 		pages := mapURLsToInstallPages(artifactURLCollection.PermanentDownloadURLs)
@@ -134,7 +210,6 @@ func exportInstallPages(artifactURLCollection ArtifactURLCollection, config Conf
 			return fmt.Errorf("failed to export BITRISE_PERMANENT_DOWNLOAD_URL_MAP: %s", err)
 		}
 		log.Printf("A map of deployed files and their permanent download urls is now available in the Environment Variable: BITRISE_PERMANENT_DOWNLOAD_URL_MAP (value: %s)", value)
-		log.Printf("")
 	}
 	return nil
 }
@@ -195,9 +270,15 @@ func applyTemplateWithMaxSize(temp *template.Template, pages []PublicInstallPage
 	return value, logWarning, nil
 }
 
-func logDeployFiles(clearedFilesToDeploy []string) {
-	for _, pth := range clearedFilesToDeploy {
-		log.Printf("- %s", pth)
+func logDeployFiles(files []deployment.DeployableItem) {
+	for _, file := range files {
+		message := fmt.Sprintf("- %s", file.Path)
+
+		if file.IntermediateFileMeta != nil {
+			message += " (pipeline intermediate file)"
+		}
+
+		log.Printf(message)
 	}
 }
 
@@ -223,13 +304,11 @@ func collectFilesToDeploy(absDeployPth string, config Config, tmpDir string) (fi
 	}
 
 	if !isDeployPathDir {
-		fmt.Println()
-		log.Infof("Deploying single file")
+		log.Printf("Build Artifact deployment mode: deploying single file")
 
 		filesToDeploy = []string{absDeployPth}
-	} else if config.IsCompress == "true" {
-		fmt.Println()
-		log.Infof("Deploying compressed Deploy directory")
+	} else if config.IsCompress {
+		log.Printf("Build Artifact deployment mode: deploying compressed deploy directory")
 
 		zipName := filepath.Base(absDeployPth)
 		if config.ZipName != "" {
@@ -243,8 +322,7 @@ func collectFilesToDeploy(absDeployPth string, config Config, tmpDir string) (fi
 
 		filesToDeploy = []string{tmpZipPath}
 	} else {
-		fmt.Println()
-		log.Infof("Deploying the content of the Deploy directory separately")
+		log.Printf("Build Artifact deployment mode: deploying the content of the deploy directory")
 
 		pattern := filepath.Join(absDeployPth, "*")
 		pths, err := filepath.Glob(pattern)
@@ -264,104 +342,147 @@ func collectFilesToDeploy(absDeployPth string, config Config, tmpDir string) (fi
 	return filesToDeploy, nil
 }
 
+func stepNameWithIndex(stepInfo models.TestResultStepInfo) string {
+	name := stepInfo.Title
+	if len(name) == 0 {
+		name = stepInfo.ID + "@" + stepInfo.Version
+	}
+	return fmt.Sprintf("%d. Step (%s)", stepInfo.Number, name)
+}
+
 func deployTestResults(config Config) {
-	if config.AddonAPIToken != "" {
-		fmt.Println()
-		log.Infof("Upload test results")
+	fmt.Println()
+	log.Infof("Collecting test results...")
+	testResults, err := test.ParseTestResults(config.TestDeployDir)
+	if err != nil {
+		log.Warnf("error during parsing test results: ", err)
+		return
+	}
+	if len(testResults) == 0 {
+		log.Printf("No test results found")
+		return
+	}
 
-		testResults, err := test.ParseTestResults(config.TestDeployDir)
-		if err != nil {
-			log.Warnf("error during parsing test results: ", err)
-		} else {
-			log.Printf("- uploading (%d) test results", len(testResults))
-
-			if err := testResults.Upload(config.AddonAPIToken, config.AddonAPIBaseURL, config.AppSlug, config.BuildSlug); err != nil {
-				log.Warnf("Failed to upload test results: ", err)
-			} else {
-				log.Donef("Success")
-			}
+	for i, result := range testResults {
+		if i == 0 {
+			log.Printf("List of test results:")
 		}
+		log.Printf("- %s (generated by the %s)", result.Name, stepNameWithIndex(result.StepInfo))
+	}
+
+	fmt.Println()
+	log.Infof("Deploying test results...")
+	if err := testResults.Upload(config.AddonAPIToken, config.AddonAPIBaseURL, config.AppSlug, config.BuildSlug); err != nil {
+		log.Warnf("Failed to upload test results: ", err)
+	} else {
+		log.Donef("Success")
 	}
 }
 
-func findAPKsAndAABs(pths []string) (apks []string, aabs []string, others []string) {
-	for _, pth := range pths {
-		switch getFileType(pth) {
+func findAPKsAndAABs(items []deployment.DeployableItem) (apks []deployment.DeployableItem, aabs []deployment.DeployableItem, others []deployment.DeployableItem) {
+	for _, item := range items {
+		switch getFileType(item.Path) {
 		case ".apk":
-			apks = append(apks, pth)
+			apks = append(apks, item)
 		case ".aab":
-			aabs = append(aabs, pth)
+			aabs = append(aabs, item)
 		default:
-			others = append(others, pth)
+			others = append(others, item)
 		}
 	}
 	return
 }
 
-func deploy(clearedFilesToDeploy []string, config Config) (ArtifactURLCollection, error) {
-	apks, aabs, others := findAPKsAndAABs(clearedFilesToDeploy)
+func deploy(deployableItems []deployment.DeployableItem, config Config) (ArtifactURLCollection, error) {
+	apks, aabs, others := findAPKsAndAABs(deployableItems)
 
-	androidArtifacts := append(apks, aabs...)
+	var androidArtifacts []string
+	for _, artifacts := range append(apks, aabs...) {
+		androidArtifacts = append(androidArtifacts, artifacts.Path)
+	}
 
 	artifactURLCollection := ArtifactURLCollection{
 		PublicInstallPageURLs: map[string]string{},
 		PermanentDownloadURLs: map[string]string{},
 	}
-	isPublic := config.IsPublicPageEnabled == "true"
+	errorCollection := []error{}
 	for _, apk := range apks {
-		log.Donef("Uploading apk file: %s", apk)
+		log.Printf("Deploying apk file: %s", apk)
 
 		artifactURLs, err := uploaders.DeployAPK(apk, androidArtifacts, config.BuildURL, config.APIToken, config.NotifyUserGroups, config.NotifyEmailList, config.IsPublicPageEnabled)
 		if err != nil {
-			return ArtifactURLCollection{}, fmt.Errorf("deploy failed, error: %s", err)
+			errorCollection = handleDeploymentFailureError(err, errorCollection)
+			continue
 		}
 
-		fillURLMaps(artifactURLCollection, artifactURLs, apk, isPublic)
+		fillURLMaps(artifactURLCollection, artifactURLs, apk.Path, config.IsPublicPageEnabled)
+
+		fmt.Println()
 	}
 
-	for _, pth := range append(aabs, others...) {
+	for _, item := range append(aabs, others...) {
+		pth := item.Path
 		fileType := getFileType(pth)
-		fmt.Println()
 
 		switch fileType {
 		case ".ipa":
-			log.Donef("Uploading ipa file: %s", pth)
+			log.Printf("Deploying ipa file: %s", pth)
 
-			artifactURLs, err := uploaders.DeployIPA(pth, config.BuildURL, config.APIToken, config.NotifyUserGroups, config.NotifyEmailList, config.IsPublicPageEnabled)
+			artifactURLs, err := uploaders.DeployIPA(item, config.BuildURL, config.APIToken, config.NotifyUserGroups, config.NotifyEmailList, config.IsPublicPageEnabled)
 			if err != nil {
-				return ArtifactURLCollection{}, fmt.Errorf("deploy failed, error: %s", err)
+				errorCollection = handleDeploymentFailureError(err, errorCollection)
+				continue
 			}
 
-			fillURLMaps(artifactURLCollection, artifactURLs, pth, isPublic)
+			fillURLMaps(artifactURLCollection, artifactURLs, pth, config.IsPublicPageEnabled)
 		case ".aab":
-			log.Donef("Uploading aab file: %s", pth)
+			log.Printf("Deploying aab file: %s", pth)
 
-			artifactURLs, err := uploaders.DeployAAB(pth, androidArtifacts, config.BuildURL, config.APIToken, config.BundletoolVersion)
+			artifactURLs, err := uploaders.DeployAAB(item, androidArtifacts, config.BuildURL, config.APIToken, config.BundletoolVersion)
 			if err != nil {
-				return ArtifactURLCollection{}, fmt.Errorf("deploy failed, error: %s", err)
+				errorCollection = handleDeploymentFailureError(err, errorCollection)
+				continue
 			}
 
 			fillURLMaps(artifactURLCollection, artifactURLs, pth, false)
 		case zippedXcarchiveExt:
-			log.Donef("Uploading xcarchive file: %s", pth)
+			log.Printf("Deploying xcarchive file: %s", pth)
 
-			artifactURLs, err := uploaders.DeployXcarchive(pth, config.BuildURL, config.APIToken)
+			artifactURLs, err := uploaders.DeployXcarchive(item, config.BuildURL, config.APIToken)
 			if err != nil {
-				return ArtifactURLCollection{}, fmt.Errorf("deploy failed, error: %s", err)
+				errorCollection = handleDeploymentFailureError(err, errorCollection)
+				continue
 			}
 			fillURLMaps(artifactURLCollection, artifactURLs, pth, false)
 		default:
-			log.Donef("Uploading file: %s", pth)
+			log.Printf("Deploying file: %s", pth)
 
-			artifactURLs, err := uploaders.DeployFile(pth, config.BuildURL, config.APIToken)
+			artifactURLs, err := uploaders.DeployFile(item, config.BuildURL, config.APIToken)
 			if err != nil {
-				return ArtifactURLCollection{}, fmt.Errorf("deploy failed, error: %s", err)
+				errorCollection = handleDeploymentFailureError(err, errorCollection)
+				continue
 			}
 
-			fillURLMaps(artifactURLCollection, artifactURLs, pth, isPublic)
+			fillURLMaps(artifactURLCollection, artifactURLs, pth, config.IsPublicPageEnabled)
 		}
+
+		fmt.Println()
 	}
-	return artifactURLCollection, nil
+
+	var errorToReturn error
+
+	if len(errorCollection) > 0 {
+		errorToReturn = errorCollection[0]
+	}
+
+	return artifactURLCollection, errorToReturn
+}
+
+func handleDeploymentFailureError(err error, errorCollection []error) []error {
+	log.Errorf(errorutil.FormattedError(err))
+	err = fmt.Errorf("deploy failed, error: %w", err)
+	errorCollection = append(errorCollection, err)
+	return errorCollection
 }
 
 func fillURLMaps(artifactURLCollection ArtifactURLCollection, artifactURLs uploaders.ArtifactURLs, apk string, tryPublic bool) {
