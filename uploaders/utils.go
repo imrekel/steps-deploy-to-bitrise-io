@@ -1,10 +1,7 @@
 package uploaders
 
 import (
-	"fmt"
 	"math"
-
-	"github.com/bitrise-io/go-utils/pathutil"
 )
 
 func round(f float64) float64 {
@@ -17,12 +14,14 @@ func roundPlus(f float64, places int) float64 {
 }
 
 func fileSizeInBytes(pth string) (float64, error) {
-	info, exist, err := pathutil.PathCheckAndInfos(pth)
-	if err != nil {
-		return 0, err
-	}
-	if !exist {
-		return 0, fmt.Errorf("file not exist at: %s", pth)
-	}
-	return float64(info.Size()), nil
+	// info, exist, err := pathutil.PathCheckAndInfos(pth)
+	// if err != nil {
+	// 	return 0, err
+	// }
+	// if !exist {
+	// 	return 0, fmt.Errorf("file not exist at: %s", pth)
+	// }
+	// return float64(info.Size()), nil
+
+	return 0, nil
 }
